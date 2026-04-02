@@ -22,6 +22,8 @@ from aiter.utility import fp4_utils
 
 BLOCK_SIZE_M = 32
 
+_MOE_SORTING_POLICY_DEFAULT = int(os.environ.get("AITER_MOE_SORTING_POLICY_DEFAULT", "0"))
+
 _USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
 
 
@@ -77,7 +79,7 @@ def moe_sorting(
     block_size=BLOCK_SIZE_M,
     expert_mask=None,
     num_local_tokens=None,
-    dispatch_policy=0,
+    dispatch_policy=_MOE_SORTING_POLICY_DEFAULT,
 ):
     try:
         return _moe_sorting_impl(
@@ -134,7 +136,7 @@ def fused_moe(
     # following for tuning
     block_size_M=None,
     num_local_tokens: Optional[torch.tensor] = None,
-    moe_sorting_dispatch_policy=0,
+    moe_sorting_dispatch_policy=_MOE_SORTING_POLICY_DEFAULT,
     dtype=None,
     # following for cktile support
     hidden_pad=0,
@@ -188,7 +190,7 @@ def fused_moe_fake(
     # following for tuning
     block_size_M: int = -1,
     num_local_tokens: Optional[torch.Tensor] = None,
-    moe_sorting_dispatch_policy: bool = 0,
+    moe_sorting_dispatch_policy: int = _MOE_SORTING_POLICY_DEFAULT,
     dtype: Optional[torch.dtype] = None,
     hidden_pad: int = 0,
     intermediate_pad: int = 0,
@@ -222,7 +224,7 @@ def fused_moe_(
     # following for tuning
     block_size_M: int = -1,
     num_local_tokens: Optional[torch.Tensor] = None,
-    moe_sorting_dispatch_policy: bool = 0,
+    moe_sorting_dispatch_policy: int = _MOE_SORTING_POLICY_DEFAULT,
     dtype: Optional[torch.dtype] = None,
     hidden_pad: int = 0,
     intermediate_pad: int = 0,
