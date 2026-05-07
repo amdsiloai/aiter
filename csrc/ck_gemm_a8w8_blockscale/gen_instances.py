@@ -54,9 +54,13 @@ class gemm_a8w8_blockscale_codegen:
             )
         return default_kernels_dict
 
-    def gen_ck_instance(self, k: KernelInstance):
+    def gen_ck_instance(self, k: KernelInstance, lookup_entries=None):
         """
-        Generate kernel instance code for ck gemm a8w8 blockscale
+        Generate kernel instance code for ck gemm a8w8 blockscale.
+
+        lookup_entries: optional list of (gfx, cu_num, M, N, K) tuples
+            that should be registered for this kernel. When provided,
+            each instance .cpp file gets a static self-registration block.
         """
 
         LEGACY_INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
@@ -240,13 +244,41 @@ template torch::Tensor
     torch::Tensor &w_scale,
     torch::Tensor &Y
     );
-
+{registration}
 """
+
+        def _gen_registration(name, dtypes, dtype_tag, entries):
+            if not entries:
+                return ""
+            lines = [
+                "",
+                '#include "gemm_kernel_registry.h"',
+                "",
+                "using BlockwiseKernel = std::function<torch::Tensor(",
+                "    torch::Tensor&, torch::Tensor&, torch::Tensor&,",
+                "    torch::Tensor&, torch::Tensor&)>;",
+                "",
+                "__attribute__((used))",
+                "static const bool _reg = [] {",
+                "    auto& r = GemmKernelRegistry<BlockwiseKernel>::instance();",
+            ]
+            for gfx, cu, m, n, kk in entries:
+                lines.append(
+                    f'    r.add("{dtype_tag}", "{gfx}", {cu}, {m}, {n}, {kk}, '
+                    f"&{name}<{dtypes}>);"
+                )
+            lines.append("    return true;")
+            lines.append("}();")
+            return "\n".join(lines) + "\n"
+
+        bf16_reg = _gen_registration(k.name, "FP32, BF16", "BF16", lookup_entries)
+        fp16_reg = _gen_registration(k.name, "FP32, FP16", "FP16", lookup_entries)
+
         INSTANCE_dFP32_eBF16 = INSTANCE_template.format(
-            name=k.name, dtypes="FP32, BF16"
+            name=k.name, dtypes="FP32, BF16", registration=bf16_reg
         )
         INSTANCE_dFP32_eFP16 = INSTANCE_template.format(
-            name=k.name, dtypes="FP32, FP16"
+            name=k.name, dtypes="FP32, FP16", registration=fp16_reg
         )
         # TODO: dFP8_eFP8
 
@@ -333,15 +365,63 @@ torch::Tensor
         Codegen for ck gemm a8w8 blockscale
         """
 
-        # generate instances code
-        for _, k in kernels_dict.items():
-            self.gen_ck_instance(k)
+        # Build reverse mapping: kernel_name -> [(gfx, cu, M, N, K), ...]
+        entries_by_kernel: dict[str, list] = {}
+        for key, k in kernels_dict.items():
+            if isinstance(key, tuple) and isinstance(key[0], str):
+                entries_by_kernel.setdefault(k.name, []).append(key)
 
-        # generate lookup dict for kernel instances
-        self.gen_lookup_dict(kernels_dict)
+        # Deduplicate kernel instances (multiple lookup keys may share a kernel)
+        seen_kernels: dict[str, KernelInstance] = {}
+        for key, k in kernels_dict.items():
+            if k.name not in seen_kernels:
+                seen_kernels[k.name] = k
 
-        # generate manifest header for kernel instances
-        self.gen_manifest_head(kernels_dict)
+        # Generate instances with self-registration
+        for name, k in seen_kernels.items():
+            self.gen_ck_instance(k, lookup_entries=entries_by_kernel.get(name))
+
+        if self.istune:
+            # Tune mode still needs the old-style lookup table and full manifest
+            self.gen_lookup_dict(kernels_dict)
+            self.gen_manifest_head(kernels_dict)
+        else:
+            # Normal mode: only the default fallback kernel is declared externally
+            self._gen_default_manifest(seen_kernels)
+
+    def _gen_default_manifest(self, seen_kernels: dict):
+        """
+        Write a minimal manifest declaring only the default fallback kernel,
+        which is still referenced directly in gemm_a8w8_blockscale.cu.
+        """
+        default_name = default_kernels_dict[(-1)].name
+        with open(
+            os.path.join(self.working_path, "gemm_a8w8_blockscale_manifest.h"),
+            "w",
+        ) as f:
+            f.write("""#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+
+#ifdef USE_ROCM
+
+#include <cstdlib>
+
+#include <torch/extension.h>
+""")
+            f.write(f"""
+template <typename DDataType, typename EDataType>
+torch::Tensor
+{default_name}(
+    torch::Tensor &XQ,
+    torch::Tensor &WQ,
+    torch::Tensor &x_scale,
+    torch::Tensor &w_scale,
+    torch::Tensor &Y);
+""")
+            f.write("""
+#endif // USE_ROCM
+""")
 
     def run(self):
         """
