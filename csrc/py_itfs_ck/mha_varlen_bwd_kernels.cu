@@ -36,8 +36,9 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
                std::optional<const at::Tensor> rng_state_,
                std::optional<at::Generator> gen_,
                std::optional<const at::Tensor> cu_seqlens_q_padded, // [b+1]
-               std::optional<const at::Tensor> cu_seqlens_k_padded // [b+1]
-               )
+               std::optional<const at::Tensor> cu_seqlens_k_padded, // [b+1]
+               std::optional<const at::Tensor> sink_,               // [b, hq] log-space sink scores (float)
+               std::optional<at::Tensor> d_sink_)                   // [hq] sink gradient output (float)
 {
     if (is_causal) { window_size_right = 0; }
 
@@ -149,37 +150,30 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
 
     bias_enum bias_type = alibi_slopes_.has_value() ? bias_enum::alibi : bias_enum::no_bias;
     auto opts = q.options();
-    const fmha_bwd_traits traits{
-        total_q,
-        total_k,
-        batch_size,
-        max_seqlen_q,
-        max_seqlen_k,
-        head_size_q,
-        head_size_v,
-        num_heads,
-        num_heads_k,
-        q_dtype_str,
-        true, // is_group_mode
-        mask.type,
-        bias_type,
-        false, // has_dbias
-        p_dropout > 0,
-        false, // is_store_randval
-        deterministic,
-    };
-    const fmha_bwd_launcher launcher(traits);
-    const ck_tile::index_t nsplits = launcher.dq_acc_splits;
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
     auto stream = at::hip::getCurrentHIPStream();
 
     auto softmax_d = torch::empty({batch_size, num_heads, total_q}, opts.dtype(at::kFloat));
-    at::Tensor dq_accum;
-    if (launcher.needs_zero_dq_acc)
-        dq_accum = torch::zeros({num_heads, nsplits, total_q, head_size_q}, opts.dtype(at::kFloat));
-    else
-        dq_accum = torch::empty({num_heads, nsplits, total_q, head_size_q}, opts.dtype(at::kFloat));
+
+    at::Tensor workspace;
+    auto workspace_alloc = [&workspace, opts](size_t bytes, bool zero_init) -> void* {
+        workspace = zero_init
+                        ? torch::zeros({static_cast<int64_t>(bytes)}, opts.dtype(at::kByte))
+                        : torch::empty({static_cast<int64_t>(bytes)}, opts.dtype(at::kByte));
+        return workspace.data_ptr();
+    };
+
+    // Pinned host buffer allocator backed by PyTorch's CachingHostAllocator.
+    // The returned shared_ptr owns the at::Tensor; aiter holds it alive via a
+    // stream-tail hipLaunchHostFunc keepalive so the buffer is not recycled
+    // while async D2H/H2D copies are still in flight on the stream.
+    auto pinned_host_alloc = [](size_t bytes) -> std::shared_ptr<void> {
+        auto t = std::make_shared<at::Tensor>(torch::empty(
+            {static_cast<int64_t>(bytes)},
+            torch::TensorOptions().dtype(at::kByte).pinned_memory(true)));
+        return std::shared_ptr<void>(t, t->data_ptr());
+    };
 
     at::Tensor dk_expanded, dv_expanded;
     if (num_heads_k != num_heads) {  // MQA / GQA
@@ -271,12 +265,6 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
             ck_tile::index_t stride_dv = dv_expanded.stride(0);
             ck_tile::index_t nhead_stride_dv = dv_expanded.stride(1);
 
-            // dq_acc: (nheads, split, total_q, hdim_v)
-            ck_tile::long_index_t batch_stride_dq_acc = 0;
-            ck_tile::long_index_t nhead_stride_dq_acc = dq_accum.stride(0);
-            ck_tile::index_t split_stride_dq_acc = dq_accum.stride(1);
-            ck_tile::index_t stride_dq_acc = dq_accum.stride(2);
-
             float p_undrop = 1.0 - p_dropout;
 
             void *alibi_slopes_ptr = nullptr;
@@ -311,6 +299,29 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
                 seqstart_q_ptr = cu_seqlens_q.data_ptr();
             }
 
+            void* sink_data_ptr   = nullptr;
+            void* d_sink_data_ptr = nullptr;
+            if (sink_.has_value() && sink_.value().defined()) {
+                const auto& sink = sink_.value();
+                CHECK_DEVICE(sink);
+                TORCH_CHECK(sink.dtype() == torch::kFloat32, "sink must be float32");
+                TORCH_CHECK(sink.is_contiguous(), "sink must be contiguous");
+                TORCH_CHECK(sink.dim() == 2 && sink.size(0) == batch_size && sink.size(1) == num_heads,
+                            "sink must have shape [batch_size, num_heads]");
+                sink_data_ptr = sink.data_ptr();
+            }
+            if (d_sink_.has_value() && d_sink_.value().defined()) {
+                TORCH_CHECK(sink_data_ptr != nullptr,
+                            "d_sink requires sink to also be provided");
+                const auto& d_sink = d_sink_.value();
+                CHECK_DEVICE(d_sink);
+                TORCH_CHECK(d_sink.dtype() == torch::kFloat32, "d_sink must be float32");
+                TORCH_CHECK(d_sink.is_contiguous(), "d_sink must be contiguous");
+                TORCH_CHECK(d_sink.dim() == 1 && d_sink.size(0) == num_heads,
+                            "d_sink must have shape [num_heads]");
+                d_sink_data_ptr = d_sink.data_ptr();
+            }
+
             return mha_bwd_args{false, // use_v3
                                 false, // is_v3_atomic_fp32
                                 false, // how_v3_bf16_cvt
@@ -340,7 +351,8 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
                                 dk_expanded.data_ptr(),
                                 dv_expanded.data_ptr(),
                                 nullptr, // dbias
-                                dq_accum.data_ptr(), // dq_acc
+                                sink_data_ptr,   // sink_ptr [b, hq]
+                                d_sink_data_ptr, // d_sink_ptr [hq]
                                 seqstart_q_ptr, // seqstart_q_ptr (physical cumulative)
                                 seqstart_k_ptr, // seqstart_k_ptr (physical cumulative)
                                 nullptr, // seqlen_q_ptr (per-sequence logical)
@@ -362,7 +374,6 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
                                 stride_o,
                                 0, // stride_randval
                                 stride_do,
-                                stride_dq_acc,
                                 stride_dq,
                                 stride_dk,
                                 stride_dv,
@@ -375,7 +386,6 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
                                 0, // nhead_stride_randval
                                 nhead_stride_do,
                                 nhead_stride_lse,
-                                nhead_stride_dq_acc,
                                 nhead_stride_dq,
                                 nhead_stride_dk,
                                 nhead_stride_dv,
@@ -388,17 +398,17 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
                                 0, // batch_stride_randval
                                 batch_stride_do,
                                 batch_stride_lse,
-                                batch_stride_dq_acc,
                                 batch_stride_dq,
                                 batch_stride_dk,
                                 batch_stride_dv,
                                 0  , // batch_stride_dbias, FA without dbias
-                                split_stride_dq_acc,
                                 mask.left,
                                 mask.right,
                                 p_dropout,
                                 p_undrop,
-                                drop_seed_offset};
+                                drop_seed_offset,
+                                workspace_alloc,
+                                pinned_host_alloc};
         }();
 
         float t = aiter::mha_bwd(args, stream_config);
